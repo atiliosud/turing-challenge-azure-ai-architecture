@@ -8,17 +8,9 @@ Este repositorio acompaña al documento. Es un esqueleto real (compila, tiene te
 
 ## Arquitectura
 
-```
-Cliente B2B ─► Front Door + WAF ─► APIM (productos/cuotas) ─► API .NET (202 + jobId)
-                                                                   │
-              ┌──────────── Service Bus: cola por etapa ───────────┘
-              ▼
-   Preprocesado (ACA) ─► Inferencia GPU (AKS T4 + Spot) ─► Postprocesado (ACA)
-     │ PostGIS · Google                                       │ Blob + PostgreSQL
-Observabilidad: App Insights / Log Analytics · Azure Monitor · sonda E2E (ACA Job) ─► Jira
-```
+![Arquitectura](docs/diagrams/architecture.png)
 
-Diagrama editable: [`docs/diagrams/architecture.drawio`](docs/diagrams/architecture.drawio) (iconos Azure oficiales de draw.io).
+Los números siguen el flujo de una petición descrito en el documento (sección 3). Fuentes: [`architecture.drawio`](docs/diagrams/architecture.drawio) (editable) y [`architecture.svg`](docs/diagrams/architecture.svg).
 
 ## Contenido
 
