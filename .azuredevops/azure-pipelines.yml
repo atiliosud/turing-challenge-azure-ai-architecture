@@ -1,28 +1,116 @@
+# TechSolutions CI/CD (Azure DevOps, multi-stage YAML)
+#   CI         : build, tests + coverage, vulnerable-package gate, secret scan, SBOM, Bicep lint, images (main only)
+#   Deploy_Dev : what-if + deploy infra, roll new images, smoke test
+#   Deploy_Prod: same artefacts, manual approval on the 'techsol-prod' environment, canary 10 % -> 100 %
+# Azure access uses service connections with Workload Identity Federation (OIDC): no secrets stored in the pipeline.
+# Approvals, branch control and business-hours checks are configured on the ADO environments, not in YAML.
+
 trigger:
   branches:
     include: [ main ]
 pr:
   branches:
     include: [ main ]
-pool:
-  vmImage: ubuntu-latest
+
 variables:
   buildConfiguration: Release
-steps:
-- task: UseDotNet@2
-  displayName: Install .NET 10 SDK
-  inputs:
-    packageType: sdk
-    version: 10.0.x
-- script: dotnet restore src/TechSolutions.Api/TechSolutions.Api.csproj
-  displayName: Restore API
-- script: dotnet build src/TechSolutions.Api/TechSolutions.Api.csproj -c $(buildConfiguration) --no-restore
-  displayName: Build API
-- script: dotnet restore src/TechSolutions.Worker/TechSolutions.Worker.csproj
-  displayName: Restore Worker
-- script: dotnet build src/TechSolutions.Worker/TechSolutions.Worker.csproj -c $(buildConfiguration) --no-restore
-  displayName: Build Worker
-- script: |
-    echo 'SECURITY GATE: enable dependency scanning, SAST and SBOM before production.'
-    echo 'DEPLOY GATE: Bicep what-if, peer review, environment approvals and OIDC required.'
-  displayName: Required production gates (documented, not implemented)
+  imageTag: $(Build.SourceVersion)
+  isMain: $[eq(variables['Build.SourceBranch'], 'refs/heads/main')]
+
+stages:
+- stage: CI
+  displayName: Build, test, scan
+  jobs:
+  - job: dotnet
+    displayName: .NET build and tests
+    pool: { vmImage: ubuntu-latest }
+    steps:
+    - task: UseDotNet@2
+      displayName: Install .NET 10 SDK
+      inputs: { packageType: sdk, version: 10.0.x }
+
+    - script: dotnet restore TuringChallenge.sln
+      displayName: Restore
+
+    - script: dotnet build TuringChallenge.sln -c $(buildConfiguration) --no-restore
+      displayName: Build
+
+    - script: dotnet test TuringChallenge.sln -c $(buildConfiguration) --no-build --logger trx --collect "XPlat Code Coverage" --results-directory $(Agent.TempDirectory)/tests
+      displayName: Unit and API tests
+
+    - task: PublishTestResults@2
+      condition: succeededOrFailed()
+      inputs: { testResultsFormat: VSTest, testResultsFiles: '$(Agent.TempDirectory)/tests/**/*.trx', failTaskOnFailedTests: true }
+
+    - task: PublishCodeCoverageResults@2
+      condition: succeededOrFailed()
+      inputs: { summaryFileLocation: '$(Agent.TempDirectory)/tests/**/coverage.cobertura.xml' }
+
+    - script: |
+        dotnet list TuringChallenge.sln package --vulnerable --include-transitive | tee vulnerable.txt
+        if grep -qiE "\b(High|Critical)\b" vulnerable.txt; then echo "##vso[task.logissue type=error]High/Critical vulnerable packages"; exit 1; fi
+      displayName: Gate - vulnerable NuGet packages (High/Critical)
+
+    - script: |
+        docker run --rm -v "$(Build.SourcesDirectory):/repo" zricethezav/gitleaks:v8.21.2 detect --source /repo --no-banner --redact --exit-code 1
+      displayName: Gate - secret scan (gitleaks)
+
+    - script: |
+        dotnet tool install --global CycloneDX
+        ~/.dotnet/tools/dotnet-CycloneDX TuringChallenge.sln -o $(Build.ArtifactStagingDirectory)/sbom -F Json
+      displayName: SBOM (CycloneDX)
+
+    - publish: $(Build.ArtifactStagingDirectory)/sbom
+      artifact: sbom
+
+  - job: iac
+    displayName: Bicep lint
+    pool: { vmImage: ubuntu-latest }
+    steps:
+    - script: |
+        az bicep install
+        az bicep lint --file infra/main.bicep
+        az bicep build --file infra/main.bicep --outfile $(Build.ArtifactStagingDirectory)/infra/main.json
+      displayName: Lint and compile Bicep
+    - publish: infra
+      artifact: infra
+
+  - job: images
+    displayName: Build images in ACR
+    dependsOn: [ dotnet, iac ]
+    condition: and(succeeded(), eq(variables.isMain, true))
+    pool: { vmImage: ubuntu-latest }
+    variables:
+    - group: techsol-dev        # acrName, serviceConnection
+    steps:
+    - task: AzureCLI@2
+      displayName: az acr build (api, worker, synthetic-probe)
+      inputs:
+        azureSubscription: $(serviceConnection)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -euo pipefail
+          for img in api:TechSolutions.Api worker:TechSolutions.Worker synthetic-probe:TechSolutions.SyntheticMonitor; do
+            name=${img%%:*}; proj=${img##*:}
+            az acr build -r $(acrName) -t $name:$(imageTag) -f src/$proj/Dockerfile . --no-logs
+          done
+
+- template: deploy-stage.yml
+  parameters:
+    name: Deploy_Dev
+    dependsOn: CI
+    environment: techsol-dev
+    variableGroup: techsol-dev
+    paramFile: infra/main.dev.bicepparam
+    canary: false
+
+- template: deploy-stage.yml
+  parameters:
+    name: Deploy_Prod
+    dependsOn: Deploy_Dev
+    environment: techsol-prod      # approval + branch check (main) configured on the environment
+    variableGroup: techsol-prod
+    paramFile: infra/main.prod.bicepparam
+    canary: true
+    importImagesFrom: $(devAcrName)   # promote the exact images tested in dev

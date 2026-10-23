@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>TechSolutions · Arquitectura API B2B de visión artificial en Azure</title>
+<style>
+  @page { size: A4; margin: 16mm 16mm 18mm 16mm;
+    @bottom-left { content: "TechSolutions · Propuesta de arquitectura · Atilio Camargo Moreira"; font: 8pt Inter, sans-serif; color: #777; }
+    @bottom-right { content: counter(page) " / " counter(pages); font: 8pt Inter, sans-serif; color: #777; } }
+  * { box-sizing: border-box; }
+  body { font-family: Inter, sans-serif; font-size: 9.6pt; line-height: 1.45; color: #161616; margin: 0; }
+  h1 { font-size: 20pt; line-height: 1.15; margin: 0 0 4pt; letter-spacing: -0.01em; }
+  h2 { font-size: 12.5pt; margin: 16pt 0 5pt; padding-top: 6pt; border-top: 1.5px solid #161616; break-after: avoid; }
+  h3 { font-size: 10.2pt; margin: 10pt 0 3pt; break-after: avoid; }
+  p { margin: 0 0 6pt; }
+  .kicker { font-size: 8.5pt; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: #555; margin-bottom: 6pt; }
+  .meta { color: #555; font-size: 9pt; margin-bottom: 12pt; }
+  .summary { border: 1.2px solid #161616; padding: 9pt 11pt; margin: 6pt 0 4pt; }
+  .summary ul { margin: 2pt 0 0; padding-left: 14pt; }
+  .summary li { margin-bottom: 3pt; }
+  table { width: 100%; border-collapse: collapse; margin: 5pt 0 8pt; font-size: 8.7pt; break-inside: auto; }
+  tr { break-inside: avoid; }
+  th { text-align: left; font-weight: 600; background: #e9e9e9; padding: 4pt 6pt; border-bottom: 1px solid #161616; }
+  td { padding: 3.5pt 6pt; border-bottom: 1px solid #d0d0d0; vertical-align: top; }
+  td.num, th.num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  tr.total td { font-weight: 700; border-top: 1.2px solid #161616; border-bottom: none; }
+  .note { font-size: 8.6pt; color: #444; }
+  .callout { border-left: 3px solid #161616; padding: 4pt 0 4pt 9pt; margin: 6pt 0 8pt; background: #f4f4f4; }
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 12pt; }
+  ul, ol { margin: 0 0 6pt; padding-left: 15pt; }
+  li { margin-bottom: 2pt; }
+  code { font-family: "DejaVu Sans Mono", monospace; font-size: 8.2pt; background: #efefef; padding: 0 2pt; }
+  figure { margin: 6pt 0 4pt; break-inside: avoid; }
+  figure svg { width: 100%; height: auto; }
+  figcaption { font-size: 8.3pt; color: #555; margin-top: 3pt; }
+  .avoid { break-inside: avoid; }
+  .pb { break-before: page; }
+</style>
+</head>
+<body>
+
+<div class="kicker">Turing Challenge · Prueba técnica de arquitectura</div>
+<h1>TechSolutions: API B2B de visión artificial en Azure</h1>
+<div class="meta">Atilio Camargo Moreira · 23 de octubre de 2026 · Código, Bicep y pipeline en el repositorio adjunto</div>
+
+<div class="summary">
+  <strong>La propuesta en cinco líneas</strong>
+  <ul>
+    <li><strong>API asíncrona.</strong> <code>POST</code> responde <code>202</code> con <code>jobId</code> en menos de 500 ms. Los 15 s de trabajo real van por colas, fuera de la conexión HTTP.</li>
+    <li><strong>Entrada gobernada.</strong> Front Door Premium con WAF delante de API Management Standard v2: un producto por tier, una suscripción por cliente, rate limit y cuota por contrato.</li>
+    <li><strong>Cómputo por etapa.</strong> Pre y postprocesado en Container Apps con KEDA. La inferencia, en un AKS pequeño con nodos T4 on-demand + Spot, escalado por profundidad de cola.</li>
+    <li><strong>Datos.</strong> PostgreSQL Flexible + PostGIS para los 150 M de parcelas, el estado de los jobs, el outbox y el ledger de uso. Resultados en Blob privado con lifecycle.</li>
+    <li><strong>Coste base estimado:</strong> ~3,4 k€/mes en valle y ~5,2 k€/mes en pico; unos <strong>46 k€/año de Azure</strong> (0,023 € por petición). Google Maps va aparte y pesa casi lo mismo.</li>
+  </ul>
+</div>
+
+<h2>1. Primero los números</h2>
+<p>Antes de elegir servicios hice las cuentas. Son las que deciden la arquitectura.</p>
+<table>
+  <tr><th style="width:34%">Dato</th><th>Cálculo e implicación</th></tr>
+  <tr><td>Tiempo de servicio nominal</td><td>2 + 10 + 3 = <strong>15 s</strong> por petición, sin cola ni reintentos.</td></tr>
+  <tr><td>Concurrencia a 50 RPS (Ley de Little)</td><td>50 × 15 = <strong>750 peticiones en vuelo</strong>. Ninguna API síncrona debería sostener eso con conexiones abiertas de 15 s.</td></tr>
+  <tr><td>Inferencias simultáneas a 50 RPS</td><td>50 × 10 = <strong>500</strong>. Si cada inferencia ocupa una T4 entera, son 500 GPUs: ~300 €/hora.</td></tr>
+  <tr><td>Volumen anual vs. picos</td><td>2 M/año = 0,063 RPS de media. A 50 RPS sostenidos, 2 M se agotan en <strong>11,1 horas</strong>.</td></tr>
+  <tr><td>Valles de 1–2 RPS continuos</td><td>1 RPS todo el año = 31,5 M peticiones. <strong>No cuadra</strong> con los 2 M anuales.</td></tr>
+  <tr><td>Almacenamiento de resultados</td><td>2 M × (5–30 KB + 0,4–1 MB) ≈ <strong>0,8–2,1 TB/año</strong>.</td></tr>
+  <tr><td>Catastro (150 M polígonos)</td><td>Con ~1–2 KB por geometría más índices GiST/B-tree estimo <strong>200–350 GB</strong>. De ahí 512 GB con autogrow.</td></tr>
+</table>
+<div class="callout"><strong>Mi lectura:</strong> los 50 RPS son ráfagas cortas en marzo–mayo y los 1–2 RPS son picos diarios, no carga continua. Dimensiono para absorber la ráfaga con colas y drenarla con capacidad elástica, no para procesar 50 RPS en tiempo real. Lo confirmaría con el cliente antes de comprar capacidad (sección 2).</div>
+<p><strong>Ejemplo de backlog que presentaría al cliente:</strong> si entran 50 RPS durante 10 minutos y la GPU procesa 10 RPS, se acumulan (50 − 10) × 600 = 24.000 jobs. Con 1 RPS de entrada posterior, se drenan a 9 RPS en unos 44 minutos. Ese es el trade-off real entre coste y latencia en pico, y es una decisión de negocio, no técnica.</p>
+<p>En un proyecto anterior bajamos una operación de ~60 s a ~5 s de respuesta percibida sacando el trabajo pesado del camino síncrono. Aquí el razonamiento es el mismo: el cliente necesita una confirmación rápida y un resultado fiable, no una conexión abierta 15 segundos.</p>
+
+<h2>2. Premisas y preguntas al cliente</h2>
+<p>Esta es la parte que haría en preventa. Cada respuesta cambia coste o SLA.</p>
+<table>
+  <tr><th style="width:46%">Pregunta</th><th>Mi premisa si no hay respuesta</th></tr>
+  <tr><td>¿Aceptáis integración asíncrona (polling o webhook)?</td><td>Sí. Ofrezco webhook firmado (HMAC) y polling.</td></tr>
+  <tr><td>¿Cuánto dura una ráfaga de 50 RPS y qué plazo máximo de resultado se contrata en pico?</td><td>Ráfagas ≤ 15 min; resultado ≤ 60 min en pico, p95 ≤ 60 s fuera de pico.</td></tr>
+  <tr><td>¿Dónde están los datos y los clientes? (el diagrama usa <em>sqft</em>; el catastro parece de EE. UU.)</td><td>West Europe. Si datos y clientes son de EE. UU., East US 2: menos latencia y GPU más barata.</td></tr>
+  <tr><td>¿Qué formato tiene el modelo y cuál es su throughput real por GPU? ¿Admite batch?</td><td>Contenedor PyTorch/ONNX; ~0,5 inferencias/s por T4 con batch (a validar en semana 1).</td></tr>
+  <tr><td>¿Qué permite la licencia de Google Maps sobre caché y almacenamiento de imágenes?</td><td>Sin caché permanente. Guardo el resultado del modelo, no la imagen original de Google, hasta revisarlo con legal.</td></tr>
+  <tr><td>¿Qué es un evento facturable: petición aceptada, inferencia o resultado entregado?</td><td>Resultado entregado (<code>completed</code>). Los fallos nuestros no se cobran.</td></tr>
+  <tr><td>¿Retención de resultados y obligación de borrado por cliente?</td><td>365 días, borrado por cliente bajo petición.</td></tr>
+  <tr><td>¿Disponibilidad, RPO/RTO y horario de soporte?</td><td>99,9 % de admisión; RPO 15 min, RTO 4 h; soporte 8×5 con guardia en temporada alta.</td></tr>
+</table>
+
+<h2 class="pb">3. Arquitectura</h2>
+<figure>
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 440" font-family="Inter, sans-serif">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#222"/></marker>
+    <style>
+      .b{fill:#fff;stroke:#222;stroke-width:1.2}
+      .g{fill:#ececec;stroke:#222;stroke-width:1.2}
+      .x{fill:#fff;stroke:#222;stroke-width:1.2;stroke-dasharray:4 3}
+      .q{fill:#d6d6d6;stroke:#222;stroke-width:1}
+      .t{font-size:12.5px;font-weight:600;fill:#111;text-anchor:middle}
+      .s{font-size:10.5px;fill:#444;text-anchor:middle}
+      .qt{font-size:10px;font-weight:600;fill:#111;text-anchor:middle}
+      .l{stroke:#222;stroke-width:1.3;fill:none;marker-end:url(#a)}
+      .d{stroke:#555;stroke-width:1.1;fill:none;stroke-dasharray:4 3}
+      .zone{font-size:10.5px;font-weight:600;fill:#555;letter-spacing:.04em}
+      .n{font-size:10px;font-weight:700;fill:#fff;text-anchor:middle}
+    </style>
+  </defs>
+
+  <!-- Row 1: edge -->
+  <rect class="b" x="20" y="20" width="150" height="52" rx="4"/><text class="t" x="95" y="42">Cliente B2B</text><text class="s" x="95" y="58">OAuth2 client credentials</text>
+  <rect class="g" x="205" y="20" width="165" height="52" rx="4"/><text class="t" x="287" y="42">Front Door Premium</text><text class="s" x="287" y="58">WAF · bots · DDoS L3/L4</text>
+  <rect class="g" x="405" y="20" width="175" height="52" rx="4"/><text class="t" x="492" y="42">API Management v2</text><text class="s" x="492" y="58">JWT · productos · cuotas</text>
+  <rect class="x" x="615" y="20" width="135" height="52" rx="4"/><text class="t" x="682" y="42">Entra ID</text><text class="s" x="682" y="58">tokens · app roles · MI</text>
+  <path class="l" d="M170,46 H203"/><path class="l" d="M370,46 H403"/>
+  <path class="d" d="M682,20 V10 H95 V20"/>
+
+  <!-- VNet -->
+  <rect x="10" y="95" width="745" height="258" rx="6" fill="#fafafa" stroke="#888" stroke-dasharray="6 4"/>
+  <text class="zone" x="22" y="111">RED PRIVADA (VNet) · PRIVATE ENDPOINTS · MANAGED IDENTITY · SIN ACCESO PÚBLICO</text>
+
+  <!-- Row 2: API -->
+  <rect class="b" x="575" y="122" width="170" height="52" rx="4"/><text class="t" x="660" y="144">API .NET (Container Apps)</text><text class="s" x="660" y="160">POST → 202 + jobId · GET estado</text>
+  <path class="l" d="M492,72 V90 H660 V120"/>
+
+  <!-- Row 3: pipeline (right to left) -->
+  <rect class="q" x="680" y="214" width="60" height="30" rx="3"/><text class="qt" x="710" y="233">cola pre</text>
+  <rect class="b" x="515" y="201" width="145" height="56" rx="4"/><text class="t" x="587" y="224">Preprocesado</text><text class="s" x="587" y="240">Container Apps · ~2 s</text>
+  <rect class="q" x="440" y="214" width="60" height="30" rx="3"/><text class="qt" x="470" y="233">cola IA</text>
+  <rect class="g" x="255" y="201" width="170" height="56" rx="4"/><text class="t" x="340" y="224">Inferencia GPU · AKS</text><text class="s" x="340" y="240">T4 + Spot · KEDA · ~10 s</text>
+  <rect class="q" x="180" y="214" width="60" height="30" rx="3"/><text class="qt" x="210" y="233">cola post</text>
+  <rect class="b" x="20" y="201" width="145" height="56" rx="4"/><text class="t" x="92" y="224">Postprocesado</text><text class="s" x="92" y="240">Container Apps · ~3 s</text>
+  <path class="l" d="M710,174 V212"/>
+  <path class="l" d="M680,229 H662"/><path class="l" d="M515,229 H502"/><path class="l" d="M440,229 H427"/><path class="l" d="M255,229 H242"/><path class="l" d="M180,229 H167"/>
+
+  <!-- Row 4: data -->
+  <rect class="b" x="20" y="292" width="175" height="48" rx="4"/><text class="t" x="107" y="312">Blob Storage</text><text class="s" x="107" y="328">JSON + imágenes · lifecycle</text>
+  <rect class="b" x="285" y="292" width="275" height="48" rx="4"/><text class="t" x="422" y="312">PostgreSQL Flexible + PostGIS</text><text class="s" x="422" y="328">150 M parcelas · jobs · outbox · ledger de uso</text>
+  <rect class="b" x="590" y="292" width="150" height="48" rx="4"/><text class="t" x="665" y="312">Key Vault</text><text class="s" x="665" y="328">secretos · token Jira</text>
+  <path class="d" d="M92,257 V290"/>
+  <path class="d" d="M540,257 V290"/>
+  <path class="d" d="M620,257 V276 H825 V259"/>
+
+  <!-- External -->
+  <rect class="x" x="770" y="203" width="115" height="54" rx="4"/><text class="t" x="827" y="225">Google Maps</text><text class="s" x="827" y="241">externo · egress</text>
+
+  <!-- Row 5: operations -->
+  <rect class="b" x="20" y="378" width="205" height="50" rx="4"/><text class="t" x="122" y="399">App Insights + Log Analytics</text><text class="s" x="122" y="415">OpenTelemetry · informe mensual</text>
+  <rect class="b" x="255" y="378" width="185" height="50" rx="4"/><text class="t" x="347" y="399">Azure Monitor</text><text class="s" x="347" y="415">alertas → Action Group</text>
+  <rect class="g" x="470" y="378" width="175" height="50" rx="4"/><text class="t" x="557" y="399">Sonda E2E (ACA Job)</text><text class="s" x="557" y="415">cada 5 min, vía Front Door</text>
+  <rect class="x" x="675" y="378" width="110" height="50" rx="4"/><text class="t" x="730" y="399">Jira</text><text class="s" x="730" y="415">incidencia única</text>
+  <path class="l" d="M225,403 H253"/><path class="l" d="M645,403 H673"/>
+  <path class="d" d="M122,353 V376"/>
+</svg>
+
+  <figcaption>Flujo principal. Cada etapa se comunica por cola (Service Bus) y persiste su resultado, de modo que un fallo no obliga a repetir llamadas a Google ni a la GPU.</figcaption>
+</figure>
+
+<h3>Flujo de una petición</h3>
+<ol>
+  <li>El cliente obtiene un token de Entra ID (client credentials) y llama a Front Door. El WAF filtra y Front Door reenvía solo a APIM.</li>
+  <li>APIM valida el JWT y el rol, aplica rate limit y cuota del producto, y toma el <code>tenantId</code> del token (nunca de una cabecera del cliente).</li>
+  <li>La API valida la petición, calcula un <code>jobId</code> determinista a partir de tenant + <code>Idempotency-Key</code>, guarda job y evento de outbox en la misma transacción y responde <code>202</code>.</li>
+  <li>El preprocesado consulta PostGIS (parcela por punto), descarga las imágenes de Google con timeout y circuit breaker, y guarda los artefactos en Blob.</li>
+  <li>La inferencia lee el artefacto, ejecuta el modelo versionado y deja la máscara en Blob.</li>
+  <li>El postprocesado convierte máscaras en polígonos, reduce vértices, calcula áreas y flags, y escribe el JSON final y la imagen resultante.</li>
+  <li>El job pasa a <code>completed</code>, se registra el evento facturable en el ledger y, si hay webhook, se notifica al cliente.</li>
+</ol>
+<p><strong>Estados:</strong> <code>accepted → preprocessing → inferencing → postprocessing → completed</code>, más <code>failed</code> (con código de error tipificado) y <code>cancelled</code>. Cada transición guarda versión de código y de modelo, intento, duración y coste estimado.</p>
+
+<h3>Contrato de la API</h3>
+<table>
+  <tr><th style="width:36%">Operación</th><th>Respuesta</th></tr>
+  <tr><td><code>POST /v1/evaluations</code></td><td><code>202 {jobId, status, statusUrl, submittedAt}</code>. Cabecera <code>Idempotency-Key</code>: el mismo valor devuelve el mismo job. Errores 400/401/403/413/429.</td></tr>
+  <tr><td><code>GET /v1/evaluations/{jobId}</code></td><td><code>200 {status, progress, error?}</code>. Siempre filtrado por tenant: un job ajeno responde 404.</td></tr>
+  <tr><td><code>GET /v1/evaluations/{jobId}/result</code></td><td><code>200</code> con polígonos, sqft por polígono, lat/long, flags y código de error; <code>409</code> si aún no está listo.</td></tr>
+  <tr><td><code>GET /v1/usage</code></td><td>Volumen aceptado, completado, fallido y facturable por periodo, desde el ledger.</td></tr>
+</table>
+
+<h2>4. Requisitos no funcionales y cómo los cubro</h2>
+<table>
+  <tr><th style="width:21%">Requisito</th><th style="width:22%">Objetivo propuesto</th><th>Decisión que lo cumple</th></tr>
+  <tr><td>Latencia de admisión</td><td>p95 &lt; 500 ms</td><td>La API solo valida y encola. Escala por peticiones concurrentes (mín. 2 réplicas).</td></tr>
+  <tr><td>Tiempo hasta resultado</td><td>p95 ≤ 60 s fuera de pico</td><td>Colas por etapa con escalado KEDA; en pico, plazo pactado según duración de ráfaga.</td></tr>
+  <tr><td>Picos de 50 RPS</td><td>0 peticiones perdidas</td><td>Service Bus absorbe la ráfaga; pool GPU Spot hasta 16 nodos; precalentado antes de marzo.</td></tr>
+  <tr><td>Disponibilidad</td><td>99,9 % admisión</td><td>Zonas de disponibilidad en ACA, Service Bus, PostgreSQL HA y ACR; Front Door global.</td></tr>
+  <tr><td>Seguridad</td><td>Sin secretos ni endpoints públicos de datos</td><td>Managed Identity en todo; Private Endpoints; Key Vault; Entra ID sin contraseñas en PostgreSQL.</td></tr>
+  <tr><td>Multi-tenant y cuota</td><td>Aislamiento y uso medible por cliente</td><td>Suscripción APIM por cliente, tenant desde el token, filtros por tenant, ledger de uso idempotente.</td></tr>
+  <tr><td>Trazabilidad</td><td>Estadística mensual de tiempos, volumen y errores</td><td>OpenTelemetry con jobId/tenant; métricas por etapa; informe mensual (KQL en el repo); 90 días + export mensual.</td></tr>
+  <tr><td>Operación</td><td>Detección antes que el cliente</td><td>Sonda E2E cada 5 min con incidencia en Jira; alertas por etapa; DLQ con reconciliación.</td></tr>
+  <tr><td>Coste</td><td>Mínimo fuera de temporada</td><td>Escalado por cola; 1 GPU caliente en valle; Spot en pico; presupuesto con alertas al 70/90/100 %.</td></tr>
+  <tr><td>Recuperación</td><td>RPO 15 min · RTO 4 h</td><td>Backups PITR de PostgreSQL; ZRS en Blob; infraestructura reproducible con Bicep.</td></tr>
+</table>
+
+<h2>5. Datos: catastro, estado y resultados</h2>
+<p><strong>PostgreSQL Flexible Server + PostGIS</strong> (General Purpose D4ds_v5, HA entre zonas, 512 GB). La consulta crítica es espacial: dada una coordenada, encontrar la parcela (<code>ST_Intersects</code> con índice GiST). Es exactamente lo que PostGIS resuelve bien y lo que Cosmos DB no resuelve sin trabajo extra. La carga inicial va por lotes con <code>COPY</code> sobre una tabla de staging, se crean índices al final y se valida el plan con <code>EXPLAIN ANALYZE</code>. Particionaría por región solo si el benchmark lo justifica.</p>
+<p>En la misma base guardo el estado de los jobs, el outbox y el ledger de uso, en esquemas separados. Así, aceptar un job y registrar su evento es una sola transacción, sin coordinación distribuida. Si el volumen crece mucho, el ledger es lo primero que separaría.</p>
+<p><strong>Blob Storage</strong> (ZRS, sin acceso público, sin claves compartidas, solo Entra ID). Contenedores <code>results</code> e <code>images</code> con ruta <code>{tenant}/{yyyy}/{MM}/{jobId}</code>. Lifecycle: Cool a los 30 días, Cold a los 90 y borrado a los 365 (configurable por contrato). Los artefactos intermedios se borran a los 7 días. Para descargas, SAS de delegación de usuario con 15 minutos de validez.</p>
+
+<h2>6. Escalabilidad e inferencia</h2>
+<p>Separo el escalado de CPU y de GPU porque tienen costes y tiempos de arranque muy distintos. La métrica que manda en todas las etapas es la profundidad de cola, no la CPU: la CPU no dice si vamos a cumplir el plazo.</p>
+<table>
+  <tr><th style="width:20%">Componente</th><th style="width:22%">Dónde</th><th style="width:28%">Regla de escalado</th><th>Límites y motivo</th></tr>
+  <tr><td>API</td><td>Container Apps</td><td>50 peticiones concurrentes por réplica</td><td>2–10 réplicas. Trabajo ligero; 2 mínimas por disponibilidad.</td></tr>
+  <tr><td>Preprocesado</td><td>Container Apps (KEDA)</td><td>10 mensajes por réplica</td><td>1–30. El máximo protege PostGIS y la cuota de Google.</td></tr>
+  <tr><td>Inferencia</td><td>AKS, nodos T4 (KEDA + cluster autoscaler)</td><td>Pods por mensajes pendientes; 1 pod por GPU</td><td>Valle: 1 nodo caliente. Pico: 2–4 on-demand + hasta 16 Spot.</td></tr>
+  <tr><td>Postprocesado</td><td>Container Apps (KEDA)</td><td>10 mensajes por réplica</td><td>1–20. CPU intensivo (máscaras a polígonos).</td></tr>
+</table>
+<h3>Por qué AKS para la GPU</h3>
+<p>Para la inferencia elegí un AKS pequeño, solo con este cometido. Me da tres cosas que necesito en pico: control del batching (Triton u ONNX Runtime), un pool Spot para la ráfaga (un desalojo solo retrasa el job, porque el mensaje vuelve a la cola) y cuota de GPU predecible por familia de VM. Descarté Container Apps serverless GPU porque su cuota por defecto es baja para cientos de inferencias en paralelo, y Azure ML Online Endpoints porque añade una plataforma más sin resolver el problema de capacidad. Lo reconsideraría si el equipo ya opera Azure ML.</p>
+<p>En BASF, con Zühlke, escalamos workers en AKS con KEDA según la profundidad de la cola. Es el mismo patrón y conozco bien sus puntos débiles: tiempo de arranque de nodos GPU (3–5 min), descarga de imágenes grandes y presupuestos de disrupción.</p>
+<h3>Preparación de la temporada alta</h3>
+<ul>
+  <li><strong>Enero:</strong> solicitud de cuota GPU en la región y prueba de carga con ráfagas de 5, 10 y 30 minutos.</li>
+  <li><strong>Febrero:</strong> subo <code>gpuMinNodes</code> a 2 en el fichero de parámetros de producción y escalo PostgreSQL a D8ds_v5.</li>
+  <li><strong>Junio:</strong> vuelta al perfil de valle. Son cambios de parámetro en Bicep revisados por pull request, no tareas manuales.</li>
+</ul>
+
+<h2>7. Seguridad, multi-tenant y cuotas</h2>
+<p><strong>Identidad.</strong> Cada cliente tiene su app en Entra ID con el rol <code>TechSolutions.Submit</code> y obtiene tokens por client credentials (certificado recomendado). APIM valida el token y la API lo vuelve a validar (defensa en profundidad). El tenant sale del claim <code>azp</code> del token, así que un cliente no puede hacerse pasar por otro cambiando una cabecera.</p>
+<p><strong>Cuotas y facturación.</strong> Un producto APIM por tier y una suscripción por contrato:</p>
+<table>
+  <tr><th>Producto</th><th class="num">Rate limit</th><th class="num">Cuota (30 días)</th><th>Uso típico</th></tr>
+  <tr><td>Bronze</td><td class="num">2 envíos/s</td><td class="num">20.000 jobs</td><td>Cliente pequeño o piloto</td></tr>
+  <tr><td>Silver</td><td class="num">10 envíos/s</td><td class="num">200.000 jobs</td><td>Cliente medio</td></tr>
+  <tr><td>Gold</td><td class="num">50 envíos/s</td><td class="num">1.000.000 jobs</td><td>Gran cuenta con temporada alta</td></tr>
+</table>
+<p>La cuota de APIM protege la plataforma, pero no es una factura: se reinicia cada 30 días desde la primera llamada y no conoce el resultado del job. La factura sale del <strong>ledger</strong> en PostgreSQL: un evento por job y tenant, idempotente, con el estado final. APIM emite además una métrica por job aceptado (tenant y producto como dimensiones) para el panel de uso y para conciliar.</p>
+<p><strong>Red y perímetro.</strong> Front Door Premium incluye protección DDoS de capa 3/4. El WAF añade reglas OWASP gestionadas, protección contra bots y un rate limit grueso por IP. APIM solo acepta tráfico de nuestro Front Door (cabecera <code>X-Azure-FDID</code>), y el entorno de Container Apps es interno. PostgreSQL, Storage, Service Bus, Key Vault y ACR no tienen endpoint público. Como no hay IPs públicas propias detrás de Front Door, no necesito DDoS Network Protection, que costaría ~2,7 k€/mes.</p>
+<p><strong>Gobierno.</strong> Managed Identity en todos los servicios, roles RBAC mínimos, PIM para accesos humanos, Azure Policy (sin acceso público, etiquetas obligatorias), Defender for Cloud y logs de auditoría centralizados.</p>
+
+<h2>8. Observabilidad, sonda E2E y alertas</h2>
+<p>Instrumento las piezas .NET con OpenTelemetry hacia Application Insights. El <code>traceId</code> viaja en los mensajes de Service Bus, así que una petición se sigue de punta a punta. Cada etapa emite <code>stage.duration</code> y el cierre del job emite <code>job.e2e.duration</code>, con tenant y resultado. El <strong>informe mensual</strong> (peticiones, completadas, errores, p95 de admisión, tiempos medios por etapa y por cliente) es una consulta KQL incluida en el repositorio, publicada como Workbook y exportada a Blob cada mes. La retención es de 90 días; el histórico anual sale de esos exports y del ledger.</p>
+<p><strong>Sonda sintética.</strong> Un Container Apps Job se ejecuta cada 5 minutos con una identidad gestionada que tiene el rol de la API, así que no necesita secreto de cliente. Entra por Front Door como un cliente más y envía una parcela con resultado conocido. Hace polling hasta el estado final y compara con tolerancia: área ±2 %, mismo número de polígonos, mismos flags y versión de modelo informada. Si el resultado es incorrecto, no hay respuesta o se supera el timeout en dos intentos seguidos, abre una incidencia en Jira. Si ya hay una abierta con la etiqueta <code>synthetic-e2e</code>, añade un comentario en vez de duplicarla. Si Jira no responde, la ejecución fallida dispara igualmente la alerta de Azure Monitor.</p>
+<table>
+  <tr><th style="width:26%">Alerta</th><th style="width:34%">Condición inicial</th><th>Por qué</th></tr>
+  <tr><td>Sonda E2E fallida</td><td>Cualquier fallo en 15 min (sev. 1)</td><td>El cliente está viendo un error ahora.</td></tr>
+  <tr><td>Sonda E2E sin datos</td><td>Sin ejecuciones en 20 min</td><td>El monitor también puede caerse.</td></tr>
+  <tr><td>Dead-letter</td><td>&gt; 0 mensajes en cualquier cola</td><td>Un job agotó reintentos; hay que reconciliar.</td></tr>
+  <tr><td>Backlog de inferencia</td><td>&gt; 5.000 mensajes durante 15 min</td><td>La GPU no alcanza el plazo pactado.</td></tr>
+  <tr><td>Errores 5xx</td><td>&gt; 2 % con ≥ 50 peticiones en 5 min</td><td>Degradación de la API.</td></tr>
+  <tr><td>Latencia de admisión</td><td>p95 &gt; 500 ms durante 10 min</td><td>La admisión debe ser siempre rápida.</td></tr>
+  <tr><td>PostGIS CPU</td><td>&gt; 80 % durante 15 min</td><td>Si el catastro va lento, todo va lento.</td></tr>
+  <tr><td>Presupuesto</td><td>70 % y 90 % real, 100 % previsto</td><td>Una GPU mal escalada se nota primero en la factura.</td></tr>
+</table>
+
+<h2>9. CI/CD con Azure DevOps</h2>
+<p>Un pipeline YAML multi-stage (en el repositorio) con el principio <strong>build once, deploy many</strong>: la imagen etiquetada con el commit que pasa en dev es exactamente la que llega a producción.</p>
+<ul>
+  <li><strong>CI (cada PR):</strong> build, tests con cobertura, bloqueo por paquetes NuGet vulnerables (High/Critical), escaneo de secretos (gitleaks), SBOM CycloneDX y lint de Bicep. En <code>main</code>, imágenes construidas en ACR con <code>az acr build</code>.</li>
+  <li><strong>Dev:</strong> <code>what-if</code> de Bicep, despliegue idempotente y ejecución de la sonda E2E como smoke test.</li>
+  <li><strong>Producción:</strong> aprobación manual en el environment de ADO (con el <code>what-if</code> en el log para el aprobador), importación de las imágenes desde el ACR de dev, canary del 10 % en una nueva revisión de Container Apps, gate automático por tasa de 5xx durante 15 minutos, promoción al 100 % y sonda E2E.</li>
+  <li><strong>Seguridad del pipeline:</strong> service connections con Workload Identity Federation (OIDC), sin secretos guardados; ramas protegidas y revisión obligatoria.</li>
+  <li><strong>Rollback:</strong> devolver el tráfico a la revisión anterior tarda segundos. Los modelos se promocionan igual que el código, con un gate de calidad sobre un dataset de referencia etiquetado.</li>
+</ul>
+
+<h2>10. Decisiones de arquitectura</h2>
+<table>
+  <tr><th style="width:18%">Decisión</th><th style="width:30%">Elegido</th><th>Descartado y por qué</th></tr>
+  <tr><td>Interacción</td><td>Asíncrona: 202 + polling o webhook</td><td>Síncrona: 750 conexiones de 15 s en pico; timeouts y reintentos en cascada.</td></tr>
+  <tr><td>Catastro</td><td>PostgreSQL + PostGIS</td><td>Cosmos DB: las consultas espaciales sobre polígonos son limitadas y caras en RU. Azure SQL tiene tipos espaciales, pero PostGIS es más completo y más barato.</td></tr>
+  <tr><td>Inferencia</td><td>AKS con pool T4 + Spot</td><td>ACA serverless GPU: cuota baja para el pico. Azure ML endpoint: otra plataforma sin ganancia en capacidad.</td></tr>
+  <tr><td>Pre y postproceso</td><td>Container Apps + KEDA</td><td>Ejecutarlos en AKS: más operación sin beneficio; aquí no hace falta GPU.</td></tr>
+  <tr><td>Mensajería</td><td>Service Bus Premium</td><td>Storage Queues: sin sesiones, sin deduplicación ni DLQ nativa. Event Grid: pensado para eventos, no para colas de trabajo.</td></tr>
+  <tr><td>Gateway</td><td>APIM Standard v2</td><td>Premium (clásico o v2): ~4× el coste. Solo lo necesitaría con multi-región activa o inyección completa en VNet.</td></tr>
+  <tr><td>Sonda E2E</td><td>Container Apps Job (cron)</td><td>Azure Function: igual de válida, pero añade otro runtime y otro pipeline. El Job reutiliza imagen, identidad y despliegue.</td></tr>
+  <tr><td>Consistencia</td><td>Outbox transaccional + IDs deterministas</td><td>Publicar en la cola dentro de la petición sin outbox: jobs huérfanos o duplicados.</td></tr>
+</table>
+
+<h2>11. Coste mensual estimado</h2>
+<p>Precios de lista pay-as-you-go en West Europe, redondeados. Es un orden de magnitud para decidir; lo cerraría con la Pricing Calculator y la suscripción real.</p>
+<table>
+  <tr><th>Componente</th><th class="num">Valle (jun–feb)</th><th class="num">Pico (mar–may)</th></tr>
+  <tr><td>Front Door Premium + WAF</td><td class="num">320 €</td><td class="num">340 €</td></tr>
+  <tr><td>API Management Standard v2 (1 unidad)</td><td class="num">650 €</td><td class="num">650 €</td></tr>
+  <tr><td>Container Apps (API, workers, sonda)</td><td class="num">150 €</td><td class="num">400 €</td></tr>
+  <tr><td>Service Bus Premium (1 MU)</td><td class="num">625 €</td><td class="num">625 €</td></tr>
+  <tr><td>PostgreSQL Flexible D4ds_v5 HA, 512 GB (D8 en pico)</td><td class="num">700 €</td><td class="num">1.200 €</td></tr>
+  <tr><td>AKS: plano de control Standard + 2 nodos de sistema</td><td class="num">230 €</td><td class="num">230 €</td></tr>
+  <tr><td>GPU T4 (valle: 1 nodo; pico: 2 on-demand + Spot)</td><td class="num">440 €</td><td class="num">1.300 €</td></tr>
+  <tr><td>Storage, ACR Premium, Key Vault, Private Endpoints y DNS</td><td class="num">150 €</td><td class="num">175 €</td></tr>
+  <tr><td>Log Analytics, Application Insights y alertas</td><td class="num">120 €</td><td class="num">250 €</td></tr>
+  <tr class="total"><td>Total Azure</td><td class="num">≈ 3.390 €</td><td class="num">≈ 5.170 €</td></tr>
+</table>
+<p><strong>Anual:</strong> 9 × 3.390 + 3 × 5.170 ≈ <strong>46 k€</strong>, unos 0,023 € por petición.</p>
+<p><strong>Google Maps (aparte):</strong> entre 9 y 14 USD por 1.000 jobs (Static Maps satélite + Street View Static, más geocodificación si el catastro no da coordenadas). Con 2 M de jobs son <strong>18–28 k USD/año</strong>, del mismo orden que toda la infraestructura Azure. Por eso persisto los artefactos del preprocesado: un reintento nunca vuelve a pagar a Google.</p>
+<h3>Optimización</h3>
+<ul>
+  <li>Reservas a 1 año para PostgreSQL, nodos de sistema y la T4 base: ~−450 €/mes.</li>
+  <li>GPU a 0 por la noche en valle, si el SLA acepta 3–5 min de arranque: ~−175 €/mes.</li>
+  <li>PostgreSQL a D2ds_v5 en valle si el benchmark lo permite: ~−250 €/mes.</li>
+  <li>Logs: tablas Basic para logs verbosos y muestreo de trazas. Las métricas de negocio no se muestrean.</li>
+  <li>Service Bus Standard ahorraría ~600 €/mes, pero pierde los private endpoints. No lo recomiendo con clientes enterprise.</li>
+</ul>
+<p>Con las tres primeras medidas el año baja a unos <strong>36–38 k€</strong>. La sensibilidad que pondría delante del cliente es otra: procesar 50 RPS en tiempo real, sin cola, con una T4 por inferencia, cuesta ~300 € por hora de ráfaga. Antes de prometer un p95 en pico, hay que medir el modelo.</p>
+
+<h2>12. Plan de entrega y equipo</h2>
+<table>
+  <tr><th style="width:22%">Fase</th><th style="width:13%">Semanas</th><th>Entregable y criterio de salida</th></tr>
+  <tr><td>Discovery + benchmark</td><td>1–2</td><td>Respuestas del cliente, throughput real del modelo por GPU, carga de una muestra del catastro con p95 de consulta, cuota GPU solicitada.</td></tr>
+  <tr><td>MVP extremo a extremo</td><td>3–5</td><td>API, colas, tres etapas, PostGIS, Blob, auth y APIM con un cliente piloto. Observabilidad básica y CI/CD a dev.</td></tr>
+  <tr><td>Hardening</td><td>6–8</td><td>Red privada completa, sonda + Jira, alertas, ledger y facturación, pruebas de carga, caos y restauración, evaluación del modelo.</td></tr>
+  <tr><td>Producción controlada</td><td>9–10</td><td>Canary con dos clientes, runbooks, revisión de seguridad, coste real frente a estimado.</td></tr>
+</table>
+<p><strong>Equipo:</strong> 1 arquitecto / technical PM (yo), 2 backend .NET, 1 platform / DevOps, 1 ML engineer, QA compartido y apoyo puntual de GIS y seguridad. El camino crítico no es el código: es la cuota de GPU, la carga de los 150 M de parcelas, la licencia de Google y la calidad del modelo. Por eso van en la semana 1.</p>
+
+<h2>13. Riesgos y mitigación</h2>
+<table>
+  <tr><th style="width:26%">Riesgo</th><th style="width:22%">Impacto</th><th>Mitigación</th></tr>
+  <tr><td>Sin capacidad GPU en la región durante el pico</td><td>Backlog y plazos incumplidos</td><td>Cuota pedida en enero, familia alternativa (A10/A100), pool Spot y región secundaria preparada en Bicep.</td></tr>
+  <tr><td>El modelo rinde menos de lo previsto por GPU</td><td>Coste de GPU ×2–×5</td><td>Benchmark en semana 1; batching; cuantización o ONNX; renegociar plazo en pico.</td></tr>
+  <tr><td>Google Maps cae, limita o sube precios</td><td>Errores o margen negativo</td><td>Circuit breaker, reintentos acotados, cuota por cliente, coste por job vigilado, proveedor alternativo evaluado.</td></tr>
+  <tr><td>Licencia de Google impide guardar imágenes</td><td>Riesgo contractual</td><td>Revisión legal antes de producción; guardar solo resultados derivados.</td></tr>
+  <tr><td>Jobs duplicados o perdidos</td><td>Doble cobro o resultados que faltan</td><td>IDs deterministas, outbox, deduplicación de Service Bus, DLQ con reconciliación diaria.</td></tr>
+  <tr><td>Fuga de datos entre clientes</td><td>Incidente contractual grave</td><td>Tenant desde el token, filtros en cada consulta y ruta, tests de acceso cruzado en CI.</td></tr>
+  <tr><td>Regresión del modelo</td><td>Resultados incorrectos sin errores visibles</td><td>Dataset de referencia, gate de calidad, sonda con tolerancias, rollback de versión.</td></tr>
+</table>
+
+<h2>14. Lo que haría distinto con más tiempo</h2>
+<ul>
+  <li>Benchmark real del modelo en T4 y A10 antes de fijar SKU; hoy el throughput por GPU es la premisa más débil del documento.</li>
+  <li>Prueba de carga del catastro con datos reales: tamaño, índices y p95 de la consulta punto-en-polígono.</li>
+  <li>Prototipo del webhook firmado y de la reconciliación de DLQ, que en el repositorio solo están descritos.</li>
+  <li>Un Workbook completo como código y un runbook por alerta.</li>
+  <li>Análisis de región con el cliente: si los datos son de EE. UU., rehacer el coste en East US 2.</li>
+</ul>
+
+<h3>Repositorio</h3>
+<p class="note">API .NET 10 (contrato, idempotencia, aislamiento por tenant), worker de referencia, sonda E2E con integración Jira y 19 tests automatizados; Bicep modular (red, datos, PostgreSQL, Container Apps, AKS GPU, APIM con productos, Front Door + WAF, alertas y presupuesto) con parámetros de dev y prod; políticas APIM; pipeline Azure DevOps multi-stage; consulta KQL del informe mensual.</p>
+
+<h3>Referencias</h3>
+<p class="note">Microsoft Learn: API Management <em>quota-by-key</em> y <em>rate-limit-by-key</em>; arquitectura multi-tenant con API Management; Container Apps (escalado KEDA, Jobs, entornos internos); AKS con nodos GPU y complemento KEDA; PostgreSQL Flexible Server (extensiones, PostGIS); Front Door + WAF; Application Insights. Google Maps Platform: precios por SKU (marzo 2025) y términos de servicio sobre caché.</p>
+
+</body>
+</html>

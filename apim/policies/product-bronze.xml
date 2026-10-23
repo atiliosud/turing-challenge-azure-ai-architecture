@@ -1,0 +1,15 @@
+<!--
+  Product "bronze": up to 2 submissions/s, 20,000 accepted jobs per 30 days
+  Counters are per subscription (one subscription per customer contract).
+  quota-by-key renews every 30 days from the first call; the monthly invoice comes from the usage ledger, not from this counter.
+-->
+<policies>
+  <inbound>
+    <base />
+    <rate-limit-by-key calls="20" renewal-period="10" counter-key="@(context.Subscription.Id)" increment-condition="@(context.Request.Method == &quot;POST&quot;)" remaining-calls-header-name="x-ratelimit-remaining" />
+    <quota-by-key calls="20000" renewal-period="2592000" counter-key="@(context.Subscription.Id)" increment-condition="@(context.Request.Method == &quot;POST&quot; &amp;&amp; context.Response.StatusCode == 202)" />
+  </inbound>
+  <backend><base /></backend>
+  <outbound><base /></outbound>
+  <on-error><base /></on-error>
+</policies>

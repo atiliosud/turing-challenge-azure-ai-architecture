@@ -15,7 +15,7 @@ public sealed class QueueWorker(IConfiguration config, ILogger<QueueWorker> logg
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var ns = config["ServiceBus:Namespace"] ?? throw new InvalidOperationException("ServiceBus namespace missing");
-        var queue = config["ServiceBus:Queue"] ?? "inference-requests";
+        var queue = config["ServiceBus:Queue"] ?? "preprocessing-requests";
         await using var client = new ServiceBusClient(ns, new DefaultAzureCredential());
         await using var processor = client.CreateProcessor(queue, new ServiceBusProcessorOptions
         {

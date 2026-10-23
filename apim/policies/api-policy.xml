@@ -1,0 +1,49 @@
+<!--
+  API-level policy (all products). Order matters:
+  1) only traffic coming through our Front Door, 2) valid Entra token with the app role,
+  3) tenant taken from the token (never from a client header), 4) usage metric for billing reconciliation.
+  Rate limit and quota live in the product policies (Bronze/Silver/Gold), because quota "calls" cannot be an expression.
+-->
+<policies>
+  <inbound>
+    <base />
+    <check-header name="X-Azure-FDID" failed-check-httpcode="403" failed-check-error-message="Direct access not allowed" ignore-case="true">
+      <value>{{frontdoor-id}}</value>
+    </check-header>
+    <validate-jwt header-name="Authorization" failed-validation-httpcode="401" require-scheme="Bearer" output-token-variable-name="jwt">
+      <openid-config url="{{entra-openid-config-url}}" />
+      <audiences><audience>{{api-audience}}</audience></audiences>
+      <required-claims>
+        <claim name="roles" match="any"><value>TechSolutions.Submit</value></claim>
+        <claim name="azp" />
+      </required-claims>
+    </validate-jwt>
+    <set-variable name="tenantId" value="@(((Jwt)context.Variables[&quot;jwt&quot;]).Claims.GetValueOrDefault(&quot;azp&quot;, &quot;&quot;))" />
+    <set-header name="x-tenant-id" exists-action="override"><value>@((string)context.Variables["tenantId"])</value></set-header>
+    <set-header name="x-correlation-id" exists-action="override"><value>@(context.RequestId.ToString())</value></set-header>
+    <set-header name="x-apim-product" exists-action="override"><value>@(context.Product?.Name ?? "none")</value></set-header>
+    <!-- Payload guard: the request is an address, never a large body. -->
+    <validate-content unspecified-content-type-action="prevent" max-size="8192" size-exceeded-action="prevent" errors-variable-name="bodyErrors">
+      <content type="application/json" validate-as="json" action="ignore" />
+    </validate-content>
+  </inbound>
+  <backend><base /></backend>
+  <outbound>
+    <base />
+    <!-- One data point per accepted job: feeds the usage dashboard. The billing ledger in PostgreSQL stays the source of truth. -->
+    <choose>
+      <when condition="@(context.Request.Method == &quot;POST&quot; &amp;&amp; context.Response.StatusCode == 202)">
+        <emit-metric name="AcceptedEvaluations" namespace="techsolutions-usage" value="1">
+          <dimension name="Tenant" value="@((string)context.Variables[&quot;tenantId&quot;])" />
+          <dimension name="Product" value="@(context.Product?.Name ?? &quot;none&quot;)" />
+          <dimension name="Subscription" value="@(context.Subscription?.Id ?? &quot;none&quot;)" />
+        </emit-metric>
+      </when>
+    </choose>
+    <set-header name="x-correlation-id" exists-action="override"><value>@(context.RequestId.ToString())</value></set-header>
+  </outbound>
+  <on-error>
+    <base />
+    <set-header name="x-correlation-id" exists-action="override"><value>@(context.RequestId.ToString())</value></set-header>
+  </on-error>
+</policies>

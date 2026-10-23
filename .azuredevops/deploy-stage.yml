@@ -1,0 +1,124 @@
+# Reusable deployment stage. The same image tag (commit SHA) is promoted from dev to prod: build once, deploy many.
+# Variable group must define: serviceConnection, resourceGroup, acrName; prod also devAcrName (images are imported, never rebuilt).
+parameters:
+- name: name
+  type: string
+- name: dependsOn
+  type: string
+- name: environment
+  type: string
+- name: variableGroup
+  type: string
+- name: paramFile
+  type: string
+- name: canary
+  type: boolean
+  default: false
+- name: importImagesFrom
+  type: string
+  default: ''
+
+stages:
+- stage: ${{ parameters.name }}
+  dependsOn: ${{ parameters.dependsOn }}
+  condition: and(succeeded(), eq(variables.isMain, true))
+  variables:
+  - group: ${{ parameters.variableGroup }}
+  jobs:
+  - deployment: deploy
+    displayName: Deploy ${{ parameters.environment }}
+    environment: ${{ parameters.environment }}
+    pool: { vmImage: ubuntu-latest }
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - ${{ if ne(parameters.importImagesFrom, '') }}:
+            - task: AzureCLI@2
+              displayName: Import tested images from dev ACR (no rebuild)
+              inputs:
+                azureSubscription: $(serviceConnection)
+                scriptType: bash
+                scriptLocation: inlineScript
+                inlineScript: |
+                  set -euo pipefail
+                  for name in api worker synthetic-probe; do
+                    az acr import -n $(acrName) --source ${{ parameters.importImagesFrom }}.azurecr.io/$name:$(imageTag) -t $name:$(imageTag) --force
+                  done
+
+          - task: AzureCLI@2
+            displayName: Infra what-if (logged for the approver)
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az deployment group what-if -g $(resourceGroup) -f infra/main.bicep -p ${{ parameters.paramFile }} -p imageTag=$(imageTag) --result-format ResourceIdOnly
+
+          - task: AzureCLI@2
+            displayName: Infra deploy (idempotent)
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az deployment group create -g $(resourceGroup) -n "techsol-$(Build.BuildId)" -f infra/main.bicep -p ${{ parameters.paramFile }} -p imageTag=$(imageTag) --only-show-errors
+
+          - ${{ if eq(parameters.canary, true) }}:
+            - task: AzureCLI@2
+              displayName: Canary - new API revision receives 10 %
+              inputs:
+                azureSubscription: $(serviceConnection)
+                scriptType: bash
+                scriptLocation: inlineScript
+                inlineScript: |
+                  set -euo pipefail
+                  app=$(az deployment group show -g $(resourceGroup) -n "techsol-$(Build.BuildId)" --query properties.outputs.apiAppName.value -o tsv)
+                  stable=$(az containerapp revision list -g $(resourceGroup) -n $app --query "[?properties.trafficWeight>\`0\`] | [0].name" -o tsv)
+                  latest=$(az containerapp show -g $(resourceGroup) -n $app --query properties.latestRevisionName -o tsv)
+                  az containerapp ingress traffic set -g $(resourceGroup) -n $app --revision-weight $stable=90 $latest=10
+                  echo "##vso[task.setvariable variable=apiApp]$app"
+                  echo "##vso[task.setvariable variable=latestRevision]$latest"
+
+            - task: AzureCLI@2
+              displayName: Canary gate - 5xx rate of the new revision over 15 min
+              inputs:
+                azureSubscription: $(serviceConnection)
+                scriptType: bash
+                scriptLocation: inlineScript
+                inlineScript: |
+                  set -euo pipefail
+                  sleep 900
+                  appi=$(az resource list -g $(resourceGroup) --resource-type Microsoft.Insights/components --query "[0].id" -o tsv)
+                  rate=$(az monitor app-insights query --ids $appi --analytics-query "requests | where timestamp > ago(15m) and cloud_RoleInstance has '$(latestRevision)' | summarize r = iif(count() == 0, 0.0, todouble(countif(toint(resultCode) >= 500)) / count())" --query "tables[0].rows[0][0]" -o tsv)
+                  echo "5xx rate on canary: $rate"
+                  python3 -c "import sys; sys.exit(0 if float('$rate') <= 0.02 else 1)"
+
+            - task: AzureCLI@2
+              displayName: Promote canary to 100 %
+              inputs:
+                azureSubscription: $(serviceConnection)
+                scriptType: bash
+                scriptLocation: inlineScript
+                inlineScript: az containerapp ingress traffic set -g $(resourceGroup) -n $(apiApp) --revision-weight latest=100
+
+          - task: AzureCLI@2
+            displayName: Smoke test - run the synthetic E2E job once
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                job=$(az deployment group show -g $(resourceGroup) -n "techsol-$(Build.BuildId)" --query properties.outputs.syntheticJobName.value -o tsv)
+                exec=$(az containerapp job start -g $(resourceGroup) -n $job --query name -o tsv)
+                for i in $(seq 1 30); do
+                  status=$(az containerapp job execution show -g $(resourceGroup) -n $job --job-execution-name $exec --query properties.status -o tsv)
+                  echo "synthetic: $status"
+                  [ "$status" = "Succeeded" ] && exit 0
+                  [ "$status" = "Failed" ] && exit 1
+                  sleep 10
+                done
+                exit 1

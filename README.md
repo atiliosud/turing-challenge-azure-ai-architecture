@@ -1,58 +1,65 @@
-# TechSolutions | Azure B2B Computer Vision — propuesta técnica
+# TechSolutions · API B2B de visión artificial en Azure
 
-**Turing Challenge · 23 octubre 2026 · Atilio Camargo Moreira**
+**Turing Challenge · Prueba técnica de arquitectura · Atilio Camargo Moreira · octubre 2026**
 
-Repositorio de acompañamiento a la propuesta PDF. Su objetivo es hacer visibles las decisiones y los primeros contratos de implementación; **no** es una plataforma desplegable en producción ni una prueba de rendimiento GPU.
+📄 **Documento principal:** [`docs/TechSolutions_Arquitectura_Azure_AtilioCamargo.pdf`](docs/TechSolutions_Arquitectura_Azure_AtilioCamargo.pdf)
 
-## Arquitectura objetivo
+Este repositorio acompaña al documento. Es un esqueleto real (compila, tiene tests y la infraestructura valida), no un sistema terminado: el modelo de IA y los conectores a Google y al catastro quedan fuera.
 
-`Cliente B2B -> Front Door/WAF -> APIM -> .NET API -> job/outbox -> Service Bus -> preprocessing/PostGIS/Google -> inferencia GPU -> postprocesado -> Blob + metadata -> GET status/result`
+## Arquitectura
 
-Servicios transversales: Entra ID, Managed Identity, Key Vault, Private Endpoints, Application Insights/Log Analytics, Azure Monitor + sintético + Jira.
+```
+Cliente B2B ─► Front Door + WAF ─► APIM (productos/cuotas) ─► API .NET (202 + jobId)
+                                                                   │
+              ┌──────────── Service Bus: cola por etapa ───────────┘
+              ▼
+   Preprocesado (ACA) ─► Inferencia GPU (AKS T4 + Spot) ─► Postprocesado (ACA)
+     │ PostGIS · Google                                       │ Blob + PostgreSQL
+Observabilidad: App Insights / Log Analytics · Azure Monitor · sonda E2E (ACA Job) ─► Jira
+```
 
-## Estructura
+Diagrama editable: [`docs/diagrams/architecture.drawio`](docs/diagrams/architecture.drawio) (iconos Azure oficiales de draw.io).
 
-- `src/TechSolutions.Api`: API .NET 10; contrato POST/GET, demo local y ejemplo de publicación en Service Bus.
-- `src/TechSolutions.Worker`: consumidor de mensajes de referencia; **envía a DLQ** porque el pipeline de IA aún no está implementado.
-- `infra/main.bicep`: infraestructura parcial (Storage, Service Bus, Log Analytics), con public network deshabilitada.
-- `.azuredevops/azure-pipelines.yml`: compilación y puntos pendientes de security/deployment gates.
-- `apim/inbound-policy.xml`: JWT, rate limiting, cuota aproximada por suscripción y correlación.
-- `docs/ADR.md`: decisiones, NFR y preguntas de dimensionamiento.
-- `docs/OPERATIONS.md`: operaciones, pruebas, Jira, delivery y límites de la muestra.
+## Contenido
 
-## Ejecutar la API en modo demostración
+| Ruta | Qué hay |
+|---|---|
+| `src/TechSolutions.Api` | API .NET 10: `POST/GET /v1/evaluations`, `Idempotency-Key` con jobId determinista, aislamiento por tenant, JWT de Entra ID. |
+| `src/TechSolutions.Worker` | Worker de referencia que consume la cola de su etapa (los handlers reales del pipeline no están). |
+| `src/TechSolutions.SyntheticMonitor*` | Sonda E2E: envía la parcela "golden", valida con tolerancia y abre/actualiza la incidencia en Jira sin duplicar. |
+| `tests/` | 19 tests: contrato e idempotencia de la API, validación de la sonda y deduplicación en Jira. |
+| `infra/` | Bicep modular: red privada, Storage, Service Bus, Key Vault, ACR, PostgreSQL + PostGIS, Container Apps, AKS GPU, APIM, Front Door + WAF, alertas y presupuesto. Parámetros de dev y prod. |
+| `infra/monthly-report.kql` | Informe mensual de tiempos, volumen y errores por cliente. |
+| `apim/policies/` | Política de la API (JWT, tenant desde el token, solo tráfico de Front Door, métrica de uso) y una por producto (Bronze/Silver/Gold/Synthetic). |
+| `.azuredevops/` | Pipeline multi-stage: CI con gates, dev, prod con aprobación y canary. |
+| `docs/` | Documento PDF, ADR y operación. |
 
-Con .NET 10 SDK:
+## Ejecutar en local
 
 ```bash
+dotnet test TuringChallenge.sln
+
 cd src/TechSolutions.Api
-dotnet run --environment Development
+dotnet run --environment Development      # DemoMode: estado en memoria, sin Azure
+
+curl -i -X POST http://localhost:5000/v1/evaluations \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: demo-001' \
+  -d '{"address":"Calle Mayor 1, Madrid"}'
 ```
 
-`appsettings.Development.json` activa `DemoMode`. Ejemplo:
-
-```bash
-curl -X POST http://localhost:5000/v1/evaluations -H 'Content-Type: application/json' -d '{"address":"Calle Mayor 1, Madrid","idempotencyKey":"demo-001"}'
-```
-
-Ajustar puerto al mostrado por `dotnet run`. El endpoint devuelve `202` y un `jobId`; la consulta GET devuelve solo el estado `accepted` almacenado **en memoria**. La demo no realiza inferencia real. En producción la API debe tener autenticación, estado durable, idempotencia y outbox transaccional.
+El mismo `Idempotency-Key` devuelve el mismo `jobId`. Ajusta el puerto al que muestre `dotnet run`.
 
 ## Infraestructura
 
 ```bash
-az deployment group what-if --resource-group <rg> --template-file infra/main.bicep --parameters suffix=<unique> location=westeurope
+az bicep build -f infra/main.bicep
+az deployment group what-if -g <rg> -f infra/main.bicep -p infra/main.dev.bicepparam
 ```
 
-**Advertencia:** el Bicep configura acceso público denegado para Storage y Service Bus y por tanto necesita VNet, Private Endpoints/DNS y roles para poder operar. Estos recursos no están en esta plantilla parcial. No desplegar en producción sin ampliar el baseline.
+Requisitos previos fuera de la plantilla: app registration de la API con el rol `TechSolutions.Submit`, grupo de Entra para administrar PostgreSQL, secretos en Key Vault (`jira-user`, `jira-api-token`, `probe-subscription-key`) y cuota de GPU en la región.
 
-## Hipótesis de capacidad
+## Números clave
 
-- 2 segundos de preprocesado + 10 de inferencia + 3 de postproceso = 15 s de tiempo nominal por job.
-- A 50 RPS, Little da 750 solicitudes simultáneas equivalentes (no 750 GPUs).
-- Si la inferencia procesa 1 job/10 s por slot, 50 RPS requeriría ~500 slots de inferencia; batching y benchmark determinan las GPUs reales.
-- 2M peticiones/año son ~0,063 RPS de media, incompatibles con un valle **continuo** de 1-2 RPS. Debe aclararse con el cliente antes de contratar SLA o reservar GPU.
-- 2M pares resultado/imagen suponen ~0,81-2,06 TB brutos, sin réplicas ni retención de logs.
-
-## Límites explícitos
-
-Este repositorio es una **referencia de arquitectura**, no una implementación terminada. No incluye la inferencia del modelo ni conexiones Google/catastro reales. Los controles productivos (segregación tenant a tenant, ledger de facturación, backpressure, network baseline, tests automáticos, despliegue y rotación de secretos) están documentados y pendientes de implementar. La estimación de costes requiere benchmark y precios regionales vigentes.
+- 2 + 10 + 3 = 15 s por petición; a 50 RPS hay 750 peticiones en vuelo. Por eso la API es asíncrona.
+- 2 M peticiones/año = 0,063 RPS de media; los 50 RPS solo pueden ser ráfagas.
+- Coste base estimado: ~3,4 k€/mes en valle, ~5,2 k€/mes en pico, ~46 k€/año (Google Maps aparte).

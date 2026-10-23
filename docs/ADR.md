@@ -1,37 +1,30 @@
-# Decisiones de arquitectura (resumen)
+# Decisiones de arquitectura
 
-| ID | Decisión | Alternativa / coste asociado |
-|---|---|---|
-| ADR-001 | API asíncrona con `202` y estado por `jobId` | HTTP síncrono de ~15s agravaría timeouts y consumo de conexiones. |
-| ADR-002 | PostgreSQL Flexible Server + PostGIS e índice GiST | Cosmos DB no sustituye directamente las operaciones espaciales complejas requeridas. Medir selectividad y planes de consulta. |
-| ADR-003 | Worker GPU desacoplado con capacidad controlada por backlog | Azure ML Managed Online Endpoint como alternativa si pesa más el ciclo de vida de ML. |
-| ADR-004 | Registro transaccional de jobs + outbox antes de publicar | El API de ejemplo no implementa el outbox; no usar tal cual en producción. |
-| ADR-005 | Resultados en Blob y metadatos en una BD operativa | No usar Blob como único índice de estado y facturación. |
-| ADR-006 | APIM para autenticación, límite de tasa y cuotas | Las cuotas de APIM no son un ledger financiero exacto; registrar consumo facturable de forma idempotente. |
+Formato corto: contexto, decisión, alternativa descartada y consecuencia.
 
-## Secuencia operativa objetivo
+| ID | Decisión | Descartado y por qué | Consecuencia |
+|---|---|---|---|
+| ADR-01 | API asíncrona: `202` + `jobId`, polling o webhook | HTTP síncrono: 750 conexiones de 15 s en pico, timeouts en cascada | El cliente integra polling/webhook; la admisión queda en < 500 ms |
+| ADR-02 | PostgreSQL Flexible + PostGIS (GiST) para catastro, jobs, outbox y ledger | Cosmos DB: consultas espaciales sobre polígonos limitadas y caras en RU. Azure SQL: válido, menos completo y más caro | Benchmark de 150 M filas en semana 1; el ledger se separa si crece |
+| ADR-03 | Inferencia en AKS con pool T4 on-demand + pool Spot, KEDA por cola | ACA serverless GPU: cuota baja para el pico. Azure ML Online Endpoint: otra plataforma sin ganar capacidad | Hay que operar un clúster pequeño; a cambio, batching, Spot y cuota predecible |
+| ADR-04 | Outbox transaccional + `jobId` determinista (tenant + `Idempotency-Key`) | Publicar en la cola dentro de la petición: jobs huérfanos o duplicados | El relay del outbox es un componente más (en el repo, el envío directo es solo de referencia) |
+| ADR-05 | Resultados en Blob, estado y facturación en PostgreSQL | Blob como índice de estado: sin consultas ni transacciones | Dos almacenes, cada uno para lo que sabe hacer |
+| ADR-06 | APIM Standard v2: producto por tier, suscripción por cliente, tenant desde el JWT | Premium: ~4× el coste, solo necesario con multi-región activa | La cuota APIM protege; la factura sale del ledger |
+| ADR-07 | Service Bus Premium, una cola por etapa | Storage Queues: sin deduplicación ni DLQ nativa. Standard: sin private endpoints | ~625 €/mes fijo, justificado por red privada y aislamiento |
+| ADR-08 | Sonda E2E como Container Apps Job (cron) que entra por Front Door | Azure Function: válida, pero otro runtime y otro pipeline. Disponibilidad HTTP simple: no valida el resultado | La sonda reutiliza imagen, identidad y despliegue |
+| ADR-09 | Front Door Premium + WAF como única entrada | DDoS Network Protection: ~2,7 k€/mes, innecesario sin IPs públicas propias | APIM solo acepta la cabecera `X-Azure-FDID` de nuestro perfil |
 
-1. APIM valida JWT, tenant, cuota y límite de tasa.
-2. API comprueba clave de idempotencia, crea job + evento outbox en transacción y devuelve 202.
-3. Relay publica en Service Bus; preprocessing calcula parcela y obtiene imágenes externas.
-4. El resultado del preprocessing se persiste; se agenda la inferencia GPU sin repetir llamadas externas innecesariamente.
-5. Inferencia guarda artefactos y versión de modelo; postproceso calcula geometrías y reglas de negocio.
-6. Estado pasa a `completed`/`failed`; resultado recuperable bajo identidad del mismo tenant.
-7. Trazas y métricas registran fases, fallos, coste estimado y latencia; DLQ y reconciliación evitan pérdida silenciosa.
+## Requisitos no funcionales a negociar
 
-## NFR propuestos para negociar
+- Admisión: p95 < 500 ms; disponibilidad 99,9 % mensual.
+- Resultado: p95 ≤ 60 s fuera de pico; en pico, plazo pactado según duración de la ráfaga.
+- RPO 15 min, RTO 4 h.
+- Sin endpoints públicos en datos; Entra ID y Managed Identity en todo.
 
-- Admisión p95 < 500 ms, excluyendo WAN del cliente, en condiciones nominales.
-- Objetivo de disponibilidad de admisión 99,9% mensual, sujeto a acuerdo comercial.
-- E2E p95 objetivo 30-60 s **fuera de ráfagas**; no prometerlo para 50 RPS hasta probar GPUs.
-- RPO <= 15 min y RTO <= 2 h como objetivos iniciales de recuperación.
-- Cifrado en tránsito y reposo, redes privadas en dependencias y acceso por identidad administrada.
+## Premisas que hay que validar
 
-## Riesgos y validaciones
-
-- 2M/año y 1-2 RPS sostenidos son incoherentes: 1 RPS permanente supone 31,5M/año.
-- 50 RPS durante ~11,1 horas consume por sí solo 2M peticiones. Definir duración de ráfagas.
-- Inferencia de 10 s a 50 RPS exige 500 slots paralelos si el modelo solo procesa una inferencia concurrente por slot; medir batch y throughput por GPU.
-- Google Maps: límites, licencias, costes por llamada, almacenamiento y políticas de uso de imágenes.
-- 150M de polígonos: definir volumen en GB, SRID, índices, frecuencia de actualización y consultas reales.
-- Egress, retención, private networking y disponibilidad regional GPU afectan coste y SLA.
+- 2 M/año y 1–2 RPS continuos no cuadran (1 RPS todo el año = 31,5 M). Interpreto ráfagas.
+- 50 RPS sostenidos consumen los 2 M en 11,1 h: hay que conocer la duración de las ráfagas.
+- Throughput real del modelo por GPU y si admite batch.
+- Licencia de Google Maps sobre caché y almacenamiento de imágenes.
+- Región: el uso de *sqft* sugiere datos de EE. UU.

@@ -1,0 +1,26 @@
+// Monthly operations report (Azure Monitor Workbook / scheduled export to Blob "exports/").
+// Source: Application Insights (workspace-based). One row per tenant and month.
+// Stage durations come from custom metrics emitted by each worker: stage.duration (dimension stage = pre|inference|post).
+let month_start = startofmonth(now(), -1);
+let month_end = endofmonth(month_start);
+let admissions = AppRequests
+    | where TimeGenerated between (month_start .. month_end) and Name has "POST /v1/evaluations"
+    | extend tenant = tostring(Properties["tenantId"])
+    | summarize submitted = count(), rejected4xx = countif(toint(ResultCode) between (400 .. 499)), errors5xx = countif(toint(ResultCode) >= 500),
+                admission_p95_ms = percentile(DurationMs, 95) by tenant;
+let jobs = AppMetrics
+    | where TimeGenerated between (month_start .. month_end) and Name == "job.e2e.duration"
+    | extend tenant = tostring(Properties["tenantId"]), outcome = tostring(Properties["outcome"])
+    | summarize completed = sumif(ItemCount, outcome == "completed"), failed = sumif(ItemCount, outcome == "failed"),
+                e2e_avg_s = round(sum(Sum) / sum(ItemCount) / 1000, 1), e2e_max_s = round(max(Max) / 1000, 1) by tenant;
+let stages = AppMetrics
+    | where TimeGenerated between (month_start .. month_end) and Name == "stage.duration"
+    | extend stage = tostring(Properties["stage"])
+    | summarize avg_s = round(sum(Sum) / sum(ItemCount) / 1000, 2) by stage
+    | summarize stage_avg_s = make_bag(bag_pack(stage, avg_s));
+admissions
+| join kind=leftouter jobs on tenant
+| extend month = format_datetime(month_start, "yyyy-MM"), error_rate = round(todouble(failed + errors5xx) / submitted * 100, 2)
+| extend stage_avg_s = toscalar(stages)
+| project month, tenant, submitted, completed, failed, rejected4xx, errors5xx, error_rate, admission_p95_ms, e2e_avg_s, e2e_max_s, stage_avg_s
+| order by submitted desc
