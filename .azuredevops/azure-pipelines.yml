@@ -1,0 +1,28 @@
+trigger:
+  branches:
+    include: [ main ]
+pr:
+  branches:
+    include: [ main ]
+pool:
+  vmImage: ubuntu-latest
+variables:
+  buildConfiguration: Release
+steps:
+- task: UseDotNet@2
+  displayName: Install .NET 10 SDK
+  inputs:
+    packageType: sdk
+    version: 10.0.x
+- script: dotnet restore src/TechSolutions.Api/TechSolutions.Api.csproj
+  displayName: Restore API
+- script: dotnet build src/TechSolutions.Api/TechSolutions.Api.csproj -c $(buildConfiguration) --no-restore
+  displayName: Build API
+- script: dotnet restore src/TechSolutions.Worker/TechSolutions.Worker.csproj
+  displayName: Restore Worker
+- script: dotnet build src/TechSolutions.Worker/TechSolutions.Worker.csproj -c $(buildConfiguration) --no-restore
+  displayName: Build Worker
+- script: |
+    echo 'SECURITY GATE: enable dependency scanning, SAST and SBOM before production.'
+    echo 'DEPLOY GATE: Bicep what-if, peer review, environment approvals and OIDC required.'
+  displayName: Required production gates (documented, not implemented)
