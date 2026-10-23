@@ -32,14 +32,14 @@ Los números siguen el flujo de una petición descrito en el documento (sección
 dotnet test TuringChallenge.sln
 
 cd src/TechSolutions.Api
-dotnet run --environment Development      # DemoMode: estado en memoria, sin Azure
+dotnet run      # perfil "demo": Development + DemoMode en http://localhost:5180, estado en memoria, sin Azure
 
-curl -i -X POST http://localhost:5000/v1/evaluations \
+curl -i -X POST http://localhost:5180/v1/evaluations \
   -H 'Content-Type: application/json' -H 'Idempotency-Key: demo-001' \
   -d '{"address":"Calle Mayor 1, Madrid"}'
 ```
 
-El mismo `Idempotency-Key` devuelve el mismo `jobId`. Ajusta el puerto al que muestre `dotnet run`.
+El mismo `Idempotency-Key` devuelve el mismo `jobId`.
 
 ## Infraestructura
 
