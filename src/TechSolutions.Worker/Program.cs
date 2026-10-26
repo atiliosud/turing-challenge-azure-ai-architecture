@@ -49,7 +49,9 @@ public sealed class QueueWorker(IConfiguration config, ILogger<QueueWorker> logg
         await using var client = new ServiceBusClient(ns, new DefaultAzureCredential());
         await using var processor = client.CreateProcessor(queue, new ServiceBusProcessorOptions
         {
-            AutoCompleteMessages = false, MaxConcurrentCalls = 2, PrefetchCount = 4
+            AutoCompleteMessages = false,
+            MaxConcurrentCalls = 2,
+            PrefetchCount = 4
         });
         processor.ProcessMessageAsync += async e =>
         {
