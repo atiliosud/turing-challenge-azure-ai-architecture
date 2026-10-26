@@ -1,0 +1,27 @@
+<!--
+  Operation policy: POST /v1/evaluations only. GET operations have no body, so body validation stays here.
+  The usage metric is emitted only for accepted jobs (202); the billing ledger in PostgreSQL stays the source of truth.
+-->
+<policies>
+  <inbound>
+    <base />
+    <!-- The request is an address: anything bigger than 8 KB or not JSON is rejected before reaching the API. -->
+    <validate-content unspecified-content-type-action="prevent" max-size="8192" size-exceeded-action="prevent" errors-variable-name="bodyErrors">
+      <content type="application/json" validate-as="json" action="ignore" />
+    </validate-content>
+  </inbound>
+  <backend><base /></backend>
+  <outbound>
+    <base />
+    <choose>
+      <when condition="@(context.Response.StatusCode == 202)">
+        <emit-metric name="AcceptedEvaluations" namespace="techsolutions-usage" value="1">
+          <dimension name="Tenant" value="@((string)context.Variables[&quot;tenantId&quot;])" />
+          <dimension name="Product" value="@(context.Product?.Name ?? &quot;none&quot;)" />
+          <dimension name="Subscription" value="@(context.Subscription?.Id ?? &quot;none&quot;)" />
+        </emit-metric>
+      </when>
+    </choose>
+  </outbound>
+  <on-error><base /></on-error>
+</policies>

@@ -1,0 +1,37 @@
+# KEDA (AKS add-on) scales the inference Deployment on the depth of inference-requests.
+# Auth: workload identity of id-inference, federated to kube-system/keda-operator, Data Owner on that queue only.
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: servicebus-workload-identity
+  namespace: inference
+spec:
+  podIdentity:
+    provider: azure-workload
+    identityId: "${INFERENCE_IDENTITY_CLIENT_ID}"
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: inference-worker
+  namespace: inference
+spec:
+  scaleTargetRef:
+    name: inference-worker
+  minReplicaCount: ${MIN_REPLICAS}   # dev 0 (gpuMinNodes = 0), prod 1 in the valley, 2 in March-May
+  maxReplicaCount: 20       # 4 on-demand + 16 Spot nodes, one pod per GPU
+  pollingInterval: 15
+  cooldownPeriod: 300
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300   # GPU nodes take minutes to come back; avoid flapping
+  triggers:
+    - type: azure-servicebus
+      metadata:
+        queueName: inference-requests
+        namespace: "${SERVICEBUS_NAMESPACE}"
+        messageCount: "5"   # roughly one batch per pod
+      authenticationRef:
+        name: servicebus-workload-identity

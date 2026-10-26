@@ -1,0 +1,89 @@
+# GPU inference worker. Placeholders ${...} are filled from the Bicep outputs (see k8s/README.md).
+# The model image is the customer's (not in this repository): it reads inference-requests, writes the mask to Blob
+# and publishes to postprocessing-requests, using workload identity (no secrets in the cluster).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: inference
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: inference-worker
+  namespace: inference
+  annotations:
+    azure.workload.identity/client-id: "${INFERENCE_IDENTITY_CLIENT_ID}"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inference-worker
+  namespace: inference
+spec:
+  replicas: 1                       # KEDA owns the replica count after the first apply
+  selector:
+    matchLabels:
+      app: inference-worker
+  template:
+    metadata:
+      labels:
+        app: inference-worker
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: inference-worker
+      terminationGracePeriodSeconds: 120   # finish the current batch; an unfinished message returns to the queue
+      nodeSelector:
+        workload: inference
+      tolerations:
+        - key: sku
+          operator: Equal
+          value: gpu
+          effect: NoSchedule
+        - key: kubernetes.azure.com/scalesetpriority
+          operator: Equal
+          value: spot
+          effect: NoSchedule
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100                  # fill warm on-demand nodes first, burst to Spot
+              preference:
+                matchExpressions:
+                  - key: capacity
+                    operator: In
+                    values: ["on-demand"]
+      containers:
+        - name: model
+          image: "${ACR_LOGIN_SERVER}/inference:${MODEL_VERSION}"
+          env:
+            - name: ServiceBus__Namespace
+              value: "${SERVICEBUS_NAMESPACE}.servicebus.windows.net"
+            - name: ServiceBus__Queue
+              value: inference-requests
+            - name: ServiceBus__NextQueue
+              value: postprocessing-requests
+            - name: Worker__Stage
+              value: inference
+            - name: MODEL_VERSION
+              value: "${MODEL_VERSION}"
+            - name: APPLICATIONINSIGHTS_CONNECTION_STRING
+              value: "${APPLICATIONINSIGHTS_CONNECTION_STRING}"
+          resources:
+            requests:
+              cpu: "2"
+              memory: 8Gi
+              nvidia.com/gpu: 1
+            limits:
+              memory: 12Gi
+              nvidia.com/gpu: 1            # one pod per T4; batching happens inside the pod
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: inference-worker
+  namespace: inference
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: inference-worker

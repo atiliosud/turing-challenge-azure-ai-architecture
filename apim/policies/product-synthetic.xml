@@ -1,0 +1,15 @@
+<!--
+  Product "synthetic": internal, one subscription owned by the platform team, used only by the E2E probe job.
+  The probe submits one job every 5 minutes and polls status with GETs (only POSTs count against the limits).
+  Its Entra identity (id-probe) is excluded from the usage ledger, so probe traffic is never invoiced.
+-->
+<policies>
+  <inbound>
+    <base />
+    <rate-limit-by-key calls="10" renewal-period="10" counter-key="@(context.Subscription.Id)" increment-condition="@(context.Request.Method == &quot;POST&quot;)" remaining-calls-header-name="x-ratelimit-remaining" />
+    <quota-by-key calls="10000" renewal-period="2592000" counter-key="@(context.Subscription.Id)" increment-condition="@(context.Request.Method == &quot;POST&quot; &amp;&amp; context.Response.StatusCode == 202)" />
+  </inbound>
+  <backend><base /></backend>
+  <outbound><base /></outbound>
+  <on-error><base /></on-error>
+</policies>

@@ -1,0 +1,108 @@
+# TechSolutions CI/CD (Azure DevOps, multi-stage YAML)
+#   CI         : build, tests + coverage, vulnerable-package gate, secret scan, SBOM, Bicep lint
+#   Deploy_Dev : bootstrap network + ACR, build images in ACR, what-if + deploy, smoke test
+#   Deploy_Prod: same artefacts, manual approval on the 'techsol-prod' environment, canary 10 % -> 100 %
+# Azure access uses service connections with Workload Identity Federation (OIDC): no secrets stored in the pipeline.
+# Service connection names are pipeline parameters: Azure DevOps resolves azureSubscription at compile time,
+# so it cannot come from a variable group. Approvals and branch checks live on the ADO environments, not in YAML.
+
+parameters:
+- name: devServiceConnection
+  type: string
+  default: sc-techsol-dev
+- name: prodServiceConnection
+  type: string
+  default: sc-techsol-prod
+
+trigger:
+  branches:
+    include: [ main ]
+pr:
+  branches:
+    include: [ main ]
+
+variables:
+  buildConfiguration: Release
+  imageTag: $(Build.SourceVersion)
+  isMain: $[eq(variables['Build.SourceBranch'], 'refs/heads/main')]
+
+stages:
+- stage: CI
+  displayName: Build, test, scan
+  jobs:
+  - job: dotnet
+    displayName: .NET build and tests
+    pool: { vmImage: ubuntu-latest }
+    steps:
+    - task: UseDotNet@2
+      displayName: Install .NET 10 SDK
+      inputs: { packageType: sdk, version: 10.0.x }
+
+    - script: dotnet restore TuringChallenge.sln
+      displayName: Restore
+
+    - script: dotnet build TuringChallenge.sln -c $(buildConfiguration) --no-restore
+      displayName: Build
+
+    - script: dotnet test TuringChallenge.sln -c $(buildConfiguration) --no-build --logger trx --collect "XPlat Code Coverage" --results-directory $(Agent.TempDirectory)/tests
+      displayName: Unit and API tests
+
+    - task: PublishTestResults@2
+      condition: succeededOrFailed()
+      inputs: { testResultsFormat: VSTest, testResultsFiles: '$(Agent.TempDirectory)/tests/**/*.trx', failTaskOnFailedTests: true }
+
+    - task: PublishCodeCoverageResults@2
+      condition: succeededOrFailed()
+      inputs: { summaryFileLocation: '$(Agent.TempDirectory)/tests/**/coverage.cobertura.xml' }
+
+    - script: |
+        dotnet list TuringChallenge.sln package --vulnerable --include-transitive | tee vulnerable.txt
+        if grep -qiE "\b(High|Critical)\b" vulnerable.txt; then echo "##vso[task.logissue type=error]High/Critical vulnerable packages"; exit 1; fi
+      displayName: Gate - vulnerable NuGet packages (High/Critical)
+
+    - script: |
+        docker run --rm -v "$(Build.SourcesDirectory):/repo" zricethezav/gitleaks:v8.21.2 detect --source /repo --no-banner --redact --exit-code 1
+      displayName: Gate - secret scan (gitleaks)
+
+    - script: |
+        dotnet tool install --global CycloneDX
+        ~/.dotnet/tools/dotnet-CycloneDX TuringChallenge.sln -o $(Build.ArtifactStagingDirectory)/sbom -F Json
+      displayName: SBOM (CycloneDX)
+
+    - publish: $(Build.ArtifactStagingDirectory)/sbom
+      artifact: sbom
+
+  - job: iac
+    displayName: Bicep lint
+    pool: { vmImage: ubuntu-latest }
+    steps:
+    - script: |
+        az bicep install
+        az bicep lint --file infra/main.bicep
+        az bicep build --file infra/main.bicep --outfile $(Build.ArtifactStagingDirectory)/infra/main.json
+      displayName: Lint and compile Bicep
+    - publish: infra
+      artifact: infra
+
+
+- template: deploy-stage.yml
+  parameters:
+    name: Deploy_Dev
+    dependsOn: CI
+    environment: techsol-dev
+    serviceConnection: ${{ parameters.devServiceConnection }}
+    variableGroup: techsol-dev
+    paramFile: infra/main.dev.bicepparam
+    canary: false
+    buildImages: true                # images are built once, in dev
+
+- template: deploy-stage.yml
+  parameters:
+    name: Deploy_Prod
+    dependsOn: Deploy_Dev
+    environment: techsol-prod      # approval + branch check (main) configured on the environment
+    serviceConnection: ${{ parameters.prodServiceConnection }}
+    variableGroup: techsol-prod
+    paramFile: infra/main.prod.bicepparam
+    canary: true
+    importImagesFrom: $(devAcrName)   # promote the exact images tested in dev
